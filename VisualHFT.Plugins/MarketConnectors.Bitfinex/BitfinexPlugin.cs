@@ -1,33 +1,19 @@
-﻿using Bitfinex.Net;
-using Bitfinex.Net.Clients;
-using Bitfinex.Net.Objects.Models;
-using Bitfinex.Net.Enums;
-
-using CryptoExchange.Net.Authentication;
-using CryptoExchange.Net.Objects;
-using MarketConnectors.Bitfinex.Model;
-using MarketConnectors.Bitfinex.UserControls;
-using MarketConnectors.Bitfinex.ViewModel;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using CryptoExchange.Net.Converters.JsonNet;
-using VisualHFT.Commons.PluginManager;
-using VisualHFT.UserSettings;
-using VisualHFT.Commons.Pools;
-using VisualHFT.Commons.Model;
+using Newtonsoft.Json.Linq;
+using TardisDev;
 using VisualHFT.Commons.Helpers;
-using CryptoExchange.Net.Objects.Sockets;
+using VisualHFT.Commons.Interfaces;
+using VisualHFT.Commons.Model;
+using VisualHFT.Commons.PluginManager;
+using VisualHFT.Commons.Pools;
 using VisualHFT.Enums;
 using VisualHFT.PluginManager;
-using VisualHFT.Commons.Interfaces;
-using Newtonsoft.Json.Linq;
-using Newtonsoft.Json;
-using VisualHFT.Commons.Exceptions;
-using CryptoExchange.Net.Interfaces;
+using VisualHFT.UserSettings;
 
 namespace MarketConnectors.Bitfinex
 {
@@ -36,20 +22,18 @@ namespace MarketConnectors.Bitfinex
         private bool _disposed = false; // to track whether the object has been disposed
 
         private PlugInSettings _settings;
-        private BitfinexSocketClient _socketClient;
-        private BitfinexRestClient _restClient;
+        private TardisAPI _tardisApi;
         private Dictionary<string, VisualHFT.Model.OrderBook> _localOrderBooks = new Dictionary<string, VisualHFT.Model.OrderBook>();
-        private Dictionary<string, HelperCustomQueue<Tuple<DateTime, string, BitfinexOrderBookEntry>>> _eventBuffers = new();
-        private Dictionary<string, HelperCustomQueue<Tuple<string, BitfinexTradeSimple>>> _tradesBuffers = new();
-
+        private HelperCustomQueue<IBinanceEventOrderBook> _eventBuffers;
+        private HelperCustomQueue<IBinanceTrade> _tradesBuffers;
         private int pingFailedAttempts = 0;
         private System.Timers.Timer _timerPing;
-        private CallResult<UpdateSubscription> deltaSubscription;
-        private CallResult<UpdateSubscription> tradesSubscription;
 
         private static readonly log4net.ILog log = log4net.LogManager.GetLogger(System.Reflection.MethodBase.GetCurrentMethod().DeclaringType);
+
         private readonly CustomObjectPool<VisualHFT.Model.Trade> tradePool = new CustomObjectPool<VisualHFT.Model.Trade>();//pool of Trade objects
 
+        private Dictionary<string, VisualHFT.Model.Order> _localUserOrders = new Dictionary<string, VisualHFT.Model.Order>();
 
         public override string Name { get; set; } = "Bitfinex Plugin";
         public override string Version { get; set; } = "1.0.0";
@@ -70,56 +54,53 @@ namespace MarketConnectors.Bitfinex
 
         public override async Task StartAsync()
         {
-
             await base.StartAsync();//call the base first
-
-            _socketClient = new BitfinexSocketClient(options =>
-            {
-                if (_settings.ApiKey != "" && _settings.ApiSecret != "")
-                    options.ApiCredentials = new ApiCredentials(_settings.ApiKey, _settings.ApiSecret);
-                options.Environment = BitfinexEnvironment.Live;
-            });
-
-            _restClient = new BitfinexRestClient(options =>
-            {
-                if (_settings.ApiKey != "" && _settings.ApiSecret != "")
-                    options.ApiCredentials = new ApiCredentials(_settings.ApiKey, _settings.ApiSecret);
-                options.Environment = BitfinexEnvironment.Live;
-            });
 
             try
             {
                 await InternalStartAsync();
-                if (Status == ePluginStatus.STOPPED_FAILED) //check again here for failure
-                    return;
-                log.Info($"Plugin has successfully started.");
-                RaiseOnDataReceived(GetProviderModel(eSESSIONSTATUS.CONNECTED));
-                Status = ePluginStatus.STARTED;
             }
             catch (Exception ex)
             {
                 var _error = ex.Message;
                 log.Error(_error, ex);
-                await HandleConnectionLost(_error, ex);
+                if (_error.IndexOf("[CantConnectError]") > -1)
+                {
+                    Status = ePluginStatus.STOPPED_FAILED;
+                    HelperNotificationManager.Instance.AddNotification(this.Name, _error, HelprNorificationManagerTypes.ERROR, HelprNorificationManagerCategories.PLUGINS);
+
+                    await ClearAsync();
+                    RaiseOnDataReceived(new List<VisualHFT.Model.OrderBook>());
+                    RaiseOnDataReceived(GetProviderModel(eSESSIONSTATUS.DISCONNECTED_FAILED));
+                }
+                else
+                {
+                    await HandleConnectionLost(_error, ex);
+                }
             }
         }
+
         private async Task InternalStartAsync()
         {
             await ClearAsync();
+            await SetupClientsAsync();
 
-            // Initialize event buffer for each symbol
-            foreach (var symbol in GetAllNormalizedSymbols())
-            {
-                _eventBuffers.Add(symbol, new HelperCustomQueue<Tuple<DateTime, string, BitfinexOrderBookEntry>>($"<Tuple<DateTime, string, BitfinexOrderBookEntry>>_{this.Name.Replace(" Plugin", "")}", eventBuffers_onReadAction, eventBuffers_onErrorAction));
-                _tradesBuffers.Add(symbol, new HelperCustomQueue<Tuple<string, BitfinexTradeSimple>>($"<Tuple<DateTime, string, BitfinexTradeSimple>>_{this.Name.Replace(" Plugin", "")}", tradesBuffers_onReadAction, tradesBuffers_onErrorAction));
-            }
+            _tradesBuffers = new HelperCustomQueue<IBinanceTrade>($"<IBinanceTrade>_{this.Name}", tradesBuffers_onReadAction, tradesBuffers_onErrorAction);
+            _eventBuffers = new HelperCustomQueue<IBinanceEventOrderBook>($"<IBinanceEventOrderBook>_{this.Name}", eventBuffers_onReadAction, eventBuffers_onErrorAction);
+
+            //Pause QUEUES until we get the snapshots ready
+            _eventBuffers.PauseConsumer();
 
             await InitializeDeltasAsync();
             await InitializeSnapshotsAsync();
             await InitializeTradesAsync();
-            await InitializeUserPrivateOrders();
             await InitializePingTimerAsync();
+
+            log.Info($"Plugin has successfully started.");
+            RaiseOnDataReceived(GetProviderModel(eSESSIONSTATUS.CONNECTED));
+            Status = ePluginStatus.STARTED;
         }
+
         public override async Task StopAsync()
         {
             Status = ePluginStatus.STOPPING;
@@ -131,29 +112,14 @@ namespace MarketConnectors.Bitfinex
 
             await base.StopAsync();
         }
+
         public async Task ClearAsync()
         {
-            UnattachEventHandlers(deltaSubscription?.Data);
-            UnattachEventHandlers(tradesSubscription?.Data);
-            if (_socketClient != null)
-                await _socketClient.UnsubscribeAllAsync();
-            if (deltaSubscription != null && deltaSubscription.Data != null)
-                await deltaSubscription.Data.CloseAsync();
-            if (tradesSubscription != null && tradesSubscription.Data != null)
-                await tradesSubscription.Data.CloseAsync();
-            await _socketClient.UnsubscribeAllAsync();
-
             _timerPing?.Stop();
             _timerPing?.Dispose();
 
-            foreach (var q in _eventBuffers)
-                q.Value.Stop();
-            _eventBuffers.Clear();
-
-            foreach (var q in _tradesBuffers)
-                q.Value.Stop();
-            _tradesBuffers.Clear();
-
+            _eventBuffers?.Clear();
+            _tradesBuffers?.Clear();
 
             //CLEAR LOB
             if (_localOrderBooks != null)
@@ -166,168 +132,38 @@ namespace MarketConnectors.Bitfinex
             }
         }
 
+        private async Task SetupClientsAsync()
+        {
+            _tardisApi = new TardisAPI(_settings.ApiKey);
+        }
+
         private async Task InitializeTradesAsync()
         {
+            log.Info($"{this.Name}: sending WS Trades Subscription to all symbols ");
             foreach (var symbol in GetAllNonNormalizedSymbols())
             {
-                var _normalizedSymbol = GetNormalizedSymbol(symbol);
-                var _traderQueueRef = _tradesBuffers[_normalizedSymbol];
-
-                log.Info($"{this.Name}: sending WS Trades Subscription {_normalizedSymbol} ");
-                tradesSubscription = await _socketClient.SpotApi.SubscribeToTradeUpdatesAsync(
-                    symbol,
-                    trade =>
-                    {
-                        // Buffer the trades
-                        if (trade.Data != null)
-                        {
-                            try
-                            {
-                                foreach (var item in trade.Data)
-                                {
-                                    item.Timestamp = trade.ReceiveTime; //not sure why these are different
-                                    _traderQueueRef.Add(
-                                        new Tuple<string, BitfinexTradeSimple>(_normalizedSymbol, item));
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-
-                                var _error = $"Will reconnect. Unhandled error while receiving trading data for {_normalizedSymbol}.";
-                                log.Error(_error, ex);
-                                Task.Run(async () => await HandleConnectionLost(_error, ex));
-                            }
-                        }
-                    });
-                if (tradesSubscription.Success)
+                var trades = await _tardisApi.GetTradesAsync(symbol);
+                foreach (var trade in trades)
                 {
-                    AttachEventHandlers(tradesSubscription.Data);
-                }
-                else
-                {
-                    var _error = $"Unsuccessful trades subscription for {_normalizedSymbol} error: {tradesSubscription.Error}";
-                    throw new Exception(_error);
+                    _tradesBuffers.Add(trade);
                 }
             }
         }
-        private async Task InitializeUserPrivateOrders()
-        {
-            if (string.IsNullOrEmpty(this._settings.ApiKey) && !string.IsNullOrEmpty(this._settings.ApiSecret))
-            {
-                await _socketClient.SpotApi.SubscribeToUserUpdatesAsync(async neworder =>
-                {
-                    log.Info(neworder.Data);
-                    if (neworder.Data != null)
-                    {
-                        IEnumerable<BitfinexOrder> item = neworder.Data;
 
-                        foreach (var order in item)
-                        {
-                            await UpdateUserOrder(order);
-                        }
-                    }
-                });
-            }
-        }
-        private async Task UpdateUserOrder(BitfinexOrder item)
-        {
-            var order = new VisualHFT.Model.Order()
-            {
-                OrderID = item.Id,
-                CreationTimeStamp = item.CreateTime,
-                PricePlaced = item.Price.ToDouble(),
-                Quantity = item.Quantity.ToDouble(),
-                ProviderId = _settings.Provider.ProviderID,
-                ProviderName = _settings.Provider.ProviderName,
-                Symbol = item.Symbol,
-                Side = item.Side == OrderSide.Buy ? eORDERSIDE.Buy : eORDERSIDE.Sell,
-                ClOrdId = item.ClientOrderId.ToString()
-            };
-            if (item.Type != OrderType.ExchangeMarket && item.Type != OrderType.Market)
-                order.Quantity = item.Quantity.ToDouble();
-
-
-            if (item.Type == OrderType.ExchangeFillOrKill || item.Type == OrderType.FillOrKill)
-                order.TimeInForce = eORDERTIMEINFORCE.FOK;
-            else if (item.Type == OrderType.ExchangeImmediateOrCancel || item.Type == OrderType.ImmediateOrCancel)
-                order.TimeInForce = eORDERTIMEINFORCE.IOC;
-            else
-                order.TimeInForce = eORDERTIMEINFORCE.GTC;
-
-            if (item.Type == OrderType.Market || item.Type == OrderType.ExchangeMarket)
-                order.OrderType = eORDERTYPE.MARKET;
-            else
-                order.OrderType = eORDERTYPE.LIMIT;
-
-            if (item.Status == OrderStatus.Active)
-            {
-                order.PricePlaced = item.Price.ToDouble();
-                order.Quantity = item.Quantity.ToDouble();
-                order.Status = eORDERSTATUS.NEW;
-            }
-            else if (item.Status == OrderStatus.Canceled)
-                order.Status = eORDERSTATUS.CANCELED;
-            else if (item.Status == OrderStatus.Executed || item.Status == OrderStatus.ForcefullyExecuted || item.Status == OrderStatus.PartiallyFilled)
-            {
-                order.Status = (item.Status == OrderStatus.PartiallyFilled ? eORDERSTATUS.PARTIALFILLED : eORDERSTATUS.FILLED);
-                order.FilledQuantity = order.Quantity - item.QuantityRemaining.ToDouble();
-                order.FilledPrice = item.PriceAverage.ToDouble();
-            }
-
-            order.LastUpdated = DateTime.Now;
-            RaiseOnDataReceived(order);
-        }
         private async Task InitializeDeltasAsync()
         {
+            log.Info($"{this.Name}: sending WS Trades Subscription to all symbols.");
             foreach (var symbol in GetAllNonNormalizedSymbols())
             {
-                var normalizedSymbol = GetNormalizedSymbol(symbol);
-                log.Info($"{this.Name}: sending WS Deltas Subscription {normalizedSymbol} ");
-                deltaSubscription = await _socketClient.SpotApi.SubscribeToOrderBookUpdatesAsync(
-                    symbol,
-                    Precision.PrecisionLevel0, Frequency.Realtime,
-                    _settings.DepthLevels,
-                    data =>
-                    {
-                        // Buffer the events
-                        if (data.Data != null)
-                        {
-                            try
-                            {
-                                if (data.UpdateType == SocketUpdateType.Snapshot)
-                                {
-                                    UpdateOrderBookSnapshot(data.Data, normalizedSymbol);
-                                }
-                                else
-                                {
-                                    foreach (var item in data.Data)
-                                    {
-                                        _eventBuffers[normalizedSymbol].Add(
-                                            new Tuple<DateTime, string, BitfinexOrderBookEntry>(
-                                                data.ReceiveTime.ToLocalTime(), normalizedSymbol, item));
-                                    }
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-
-                                var _error = $"Will reconnect. Unhandled error while receiving delta market data for {normalizedSymbol}.";
-                                log.Error(_error, ex);
-                                Task.Run(async () => await HandleConnectionLost(_error, ex));
-                            }
-                        }
-                    }, null, new CancellationToken());
-                if (deltaSubscription.Success)
+                var orderBookUpdates = await _tardisApi.GetOrderBookUpdatesAsync(symbol);
+                foreach (var update in orderBookUpdates)
                 {
-                    AttachEventHandlers(deltaSubscription.Data);
-                }
-                else
-                {
-                    var _error = $"Unsuccessful deltas subscription for {normalizedSymbol} error: {deltaSubscription.Error}";
-                    throw new Exception(_error);
+                    _eventBuffers.Add(update);
                 }
             }
+            _eventBuffers.ResumeConsumer();
         }
+
         private async Task InitializeSnapshotsAsync()
         {
             foreach (var symbol in GetAllNonNormalizedSymbols())
@@ -339,20 +175,19 @@ namespace MarketConnectors.Bitfinex
                 }
                 log.Info($"{this.Name}: Getting snapshot {normalizedSymbol} level 2");
 
-                // Fetch initial depth snapshot
-                var depthSnapshot = await _restClient.SpotApi.ExchangeData.GetOrderBookAsync(symbol, Precision.PrecisionLevel0, _settings.DepthLevels);
-                if (depthSnapshot.Success)
+                var depthSnapshot = await _tardisApi.GetOrderBookSnapshotAsync(symbol);
+                if (depthSnapshot != null)
                 {
-                    _localOrderBooks[normalizedSymbol] = ToOrderBookModel(depthSnapshot.Data, normalizedSymbol);
-                    log.Info($"{this.Name}: LOB {normalizedSymbol} level 2 Successfully loaded.");
+                    _localOrderBooks[normalizedSymbol] = ToOrderBookModel(depthSnapshot);
                 }
                 else
                 {
-                    var _error = $"Unsuccessful snapshot request for {normalizedSymbol} error: {depthSnapshot.ResponseStatusCode} - {depthSnapshot.Error}";
+                    var _error = $"Unsuccessful snapshot request for {normalizedSymbol}";
                     throw new Exception(_error);
                 }
             }
         }
+
         private async Task InitializePingTimerAsync()
         {
             _timerPing?.Stop();
@@ -364,10 +199,12 @@ namespace MarketConnectors.Bitfinex
             _timerPing.Enabled = true; // Start the timer
         }
 
-        private void eventBuffers_onReadAction(Tuple<DateTime, string, BitfinexOrderBookEntry> eventData)
+        private void eventBuffers_onReadAction(IBinanceEventOrderBook eventData)
         {
-            UpdateOrderBook(eventData.Item3, eventData.Item2, eventData.Item1);
+            var symbol = GetNormalizedSymbol(eventData.Symbol);
+            UpdateOrderBook(eventData, symbol);
         }
+
         private void eventBuffers_onErrorAction(Exception ex)
         {
             var _error = $"Will reconnect. Unhandled error in the Market Data Queue: {ex.Message}";
@@ -375,21 +212,24 @@ namespace MarketConnectors.Bitfinex
             log.Error(_error, ex);
             Task.Run(async () => await HandleConnectionLost(_error, ex));
         }
-        private void tradesBuffers_onReadAction(Tuple<string, BitfinexTradeSimple> item)
+
+        private void tradesBuffers_onReadAction(IBinanceTrade eventData)
         {
+            var _symbol = GetNormalizedSymbol(eventData.Symbol);
             var trade = tradePool.Get();
-            trade.Price = item.Item2.Price;
-            trade.Size = Math.Abs(item.Item2.Quantity);
-            trade.Symbol = item.Item1;
-            trade.Timestamp = item.Item2.Timestamp.ToLocalTime();
+            trade.Price = eventData.Price;
+            trade.Size = eventData.Quantity;
+            trade.Symbol = _symbol;
+            trade.Timestamp = eventData.TradeTime.ToLocalTime();
             trade.ProviderId = _settings.Provider.ProviderID;
             trade.ProviderName = _settings.Provider.ProviderName;
-            trade.IsBuy = item.Item2.Quantity > 0;
-            trade.MarketMidPrice = _localOrderBooks[item.Item1]?.MidPrice ?? 0;
+            trade.IsBuy = eventData.BuyerIsMaker;
+            trade.MarketMidPrice = _localOrderBooks[_symbol].MidPrice;
 
             RaiseOnDataReceived(trade);
             tradePool.Return(trade);
         }
+
         private void tradesBuffers_onErrorAction(Exception ex)
         {
             var _error = $"Will reconnect. Unhandled error in the Trades Queue: {ex.Message}";
@@ -398,102 +238,109 @@ namespace MarketConnectors.Bitfinex
             Task.Run(async () => await HandleConnectionLost(_error, ex));
         }
 
-
-        #region Websocket Deltas Callbacks
-        private void AttachEventHandlers(UpdateSubscription data)
+        private void UpdateOrderBook(IBinanceEventOrderBook lob_update, string normalizedSymbol)
         {
-            if (data == null)
-                return;
-            data.Exception += deltaSubscription_Exception;
-            data.ConnectionLost += deltaSubscription_ConnectionLost;
-            data.ConnectionClosed += deltaSubscription_ConnectionClosed;
-            data.ConnectionRestored += deltaSubscription_ConnectionRestored;
-            data.ActivityPaused += deltaSubscription_ActivityPaused;
-            data.ActivityUnpaused += deltaSubscription_ActivityUnpaused;
-        }
-        private void UnattachEventHandlers(UpdateSubscription data)
-        {
-            if (data == null)
+            if (!_localOrderBooks.ContainsKey(normalizedSymbol))
                 return;
 
-            data.Exception -= deltaSubscription_Exception;
-            data.ConnectionLost -= deltaSubscription_ConnectionLost;
-            data.ConnectionClosed -= deltaSubscription_ConnectionClosed;
-            data.ConnectionRestored -= deltaSubscription_ConnectionRestored;
-            data.ActivityPaused -= deltaSubscription_ActivityPaused;
-            data.ActivityUnpaused -= deltaSubscription_ActivityUnpaused;
-        }
-        private void deltaSubscription_ActivityUnpaused()
-        {
-            //throw new NotImplementedException();
-        }
-        private void deltaSubscription_ActivityPaused()
-        {
-            //throw new NotImplementedException();
-        }
-        private void deltaSubscription_ConnectionRestored(TimeSpan obj)
-        {
-            //throw new NotImplementedException();
-        }
-        private void deltaSubscription_ConnectionClosed()
-        {
-            if (Status != ePluginStatus.STOPPING && Status != ePluginStatus.STOPPED) //avoid executing this if we are actually trying to disconnect.
-                Task.Run(async () => await HandleConnectionLost("Websocket has been closed from the server (no informed reason)."));
-        }
-        private void deltaSubscription_ConnectionLost()
-        {
-            Task.Run(async () => await HandleConnectionLost("Websocket connection has been lost (no informed reason)."));
-        }
-        private void deltaSubscription_Exception(Exception obj)
-        {
-            string _error = $"Websocket error: {obj.Message}";
-            log.Error(_error, obj);
-            HelperNotificationManager.Instance.AddNotification(this.Name, _error, HelprNorificationManagerTypes.ERROR, HelprNorificationManagerCategories.PLUGINS);
+            var local_lob = _localOrderBooks[normalizedSymbol];
+            DateTime ts = lob_update.EventTime.ToLocalTime();
 
-            Task.Run(StopAsync);
+            if (lob_update.LastUpdateId <= local_lob.Sequence)
+                return;
 
-            Status = ePluginStatus.STOPPED_FAILED;
-            RaiseOnDataReceived(GetProviderModel(eSESSIONSTATUS.DISCONNECTED_FAILED));
+            if (lob_update.FirstUpdateId > local_lob.Sequence &&
+                lob_update.FirstUpdateId != local_lob.Sequence + 1)
+                throw new Exception("Detected sequence gap.");
+
+            foreach (var item in lob_update.Bids)
+            {
+                if (item.Quantity != 0)
+                {
+                    local_lob.AddOrUpdateLevel(new DeltaBookItem()
+                    {
+                        MDUpdateAction = eMDUpdateAction.None,
+                        Price = (double)item.Price,
+                        Size = (double)item.Quantity,
+                        IsBid = true,
+                        LocalTimeStamp = DateTime.Now,
+                        ServerTimeStamp = ts,
+                        Symbol = normalizedSymbol
+                    });
+                }
+                else
+                    local_lob.DeleteLevel(new DeltaBookItem()
+                    {
+                        MDUpdateAction = eMDUpdateAction.Delete,
+                        Price = (double)item.Price,
+                        IsBid = true,
+                        LocalTimeStamp = DateTime.Now,
+                        ServerTimeStamp = ts,
+                        Symbol = normalizedSymbol
+                    });
+            }
+            foreach (var item in lob_update.Asks)
+            {
+                if (item.Quantity != 0)
+                {
+                    local_lob.AddOrUpdateLevel(new DeltaBookItem()
+                    {
+                        MDUpdateAction = eMDUpdateAction.None,
+                        Price = (double)item.Price,
+                        Size = (double)item.Quantity,
+                        IsBid = false,
+                        LocalTimeStamp = DateTime.Now,
+                        ServerTimeStamp = ts,
+                        Symbol = normalizedSymbol
+                    });
+                }
+                else
+                    local_lob.DeleteLevel(new DeltaBookItem()
+                    {
+                        MDUpdateAction = eMDUpdateAction.Delete,
+                        Price = (double)item.Price,
+                        IsBid = false,
+                        LocalTimeStamp = DateTime.Now,
+                        ServerTimeStamp = ts,
+                        Symbol = normalizedSymbol
+                    });
+            }
+            local_lob.Sequence = lob_update.LastUpdateId;
+
+            RaiseOnDataReceived(local_lob);
         }
-        #endregion
-
 
         private async Task DoPingAsync()
         {
             try
             {
                 if (Status == ePluginStatus.STOPPED || Status == ePluginStatus.STOPPING || Status == ePluginStatus.STOPPED_FAILED)
-                    return; //do not ping if any of these statues
+                    return;
 
-                bool isConnected = _socketClient.CurrentConnections > 0;
+                bool isConnected = _tardisApi != null;
                 if (!isConnected)
                 {
                     throw new Exception("The socket seems to be disconnected.");
                 }
 
-
                 DateTime ini = DateTime.Now;
-                var result = await _restClient.SpotApi.ExchangeData.GetPlatformStatusAsync();
-                if (result != null)
+                var result = await _tardisApi.PingAsync();
+                if (result)
                 {
                     var timeLapseInMicroseconds = DateTime.Now.Subtract(ini).TotalMicroseconds;
 
-
-                    // Connection is healthy
-                    pingFailedAttempts = 0; // Reset the failed attempts on a successful ping
+                    pingFailedAttempts = 0;
 
                     RaiseOnDataReceived(GetProviderModel(eSESSIONSTATUS.CONNECTED));
                 }
                 else
                 {
-                    // Consider the ping failed
                     throw new Exception("Ping failed, result was null.");
                 }
             }
             catch (Exception ex)
             {
-
-                if (++pingFailedAttempts >= 5) //5 attempts
+                if (++pingFailedAttempts >= 5)
                 {
                     var _error = $"Will reconnect. Unhandled error in DoPingAsync. Initiating reconnection. {ex.Message}";
 
@@ -502,113 +349,56 @@ namespace MarketConnectors.Bitfinex
                     Task.Run(async () => await HandleConnectionLost(_error, ex));
                 }
             }
-
         }
-        private VisualHFT.Model.OrderBook ToOrderBookModel(BitfinexOrderBook data, string symbol)
+
+        private VisualHFT.Model.OrderBook ToOrderBookModel(BinanceOrderBook data)
         {
             var identifiedPriceDecimalPlaces = RecognizeDecimalPlacesAutomatically(data.Asks.Select(x => x.Price));
 
-            var lob = new VisualHFT.Model.OrderBook(symbol, identifiedPriceDecimalPlaces, _settings.DepthLevels);
+            var lob = new VisualHFT.Model.OrderBook(GetNormalizedSymbol(data.Symbol), identifiedPriceDecimalPlaces, _settings.DepthLevels);
             lob.ProviderID = _settings.Provider.ProviderID;
             lob.ProviderName = _settings.Provider.ProviderName;
             lob.SizeDecimalPlaces = RecognizeDecimalPlacesAutomatically(data.Asks.Select(x => x.Quantity));
 
+            var _asks = new List<VisualHFT.Model.BookItem>();
+            var _bids = new List<VisualHFT.Model.BookItem>();
             data.Asks.ToList().ForEach(x =>
             {
-                lob.AddOrUpdateLevel(new DeltaBookItem()
+                _asks.Add(new VisualHFT.Model.BookItem()
                 {
                     IsBid = false,
                     Price = (double)x.Price,
                     Size = (double)x.Quantity,
                     LocalTimeStamp = DateTime.Now,
                     ServerTimeStamp = DateTime.Now,
-                    Symbol = symbol,
-                    MDUpdateAction = eMDUpdateAction.New,
+                    Symbol = lob.Symbol,
+                    PriceDecimalPlaces = lob.PriceDecimalPlaces,
+                    SizeDecimalPlaces = lob.SizeDecimalPlaces,
+                    ProviderID = lob.ProviderID,
                 });
             });
             data.Bids.ToList().ForEach(x =>
             {
-                lob.AddOrUpdateLevel(new DeltaBookItem()
+                _bids.Add(new VisualHFT.Model.BookItem()
                 {
                     IsBid = true,
                     Price = (double)x.Price,
                     Size = (double)x.Quantity,
                     LocalTimeStamp = DateTime.Now,
                     ServerTimeStamp = DateTime.Now,
-                    Symbol = symbol,
-                    MDUpdateAction = eMDUpdateAction.New,
+                    Symbol = lob.Symbol,
+                    PriceDecimalPlaces = lob.PriceDecimalPlaces,
+                    SizeDecimalPlaces = lob.SizeDecimalPlaces,
+                    ProviderID = lob.ProviderID,
                 });
             });
-
+            lob.Sequence = data.LastUpdateId;
+            lob.LoadData(
+                _asks.OrderBy(x => x.Price).Take(_settings.DepthLevels),
+                _bids.OrderByDescending(x => x.Price).Take(_settings.DepthLevels)
+            );
             return lob;
         }
-        private void UpdateOrderBookSnapshot(IEnumerable<BitfinexOrderBookEntry> data, string symbol)
-        {
-            if (!_localOrderBooks.TryGetValue(symbol, out VisualHFT.Model.OrderBook? lob))
-            {
-                return;
-            }
-            lob.Clear(); //reset order book
-
-            data.ToList().ForEach(x =>
-            {
-                lob.AddOrUpdateLevel(new DeltaBookItem()
-                {
-                    IsBid = (x.Quantity > 0),
-                    Price = (double)x.Price,
-                    Size = (double)Math.Abs(x.Quantity),
-                    LocalTimeStamp = DateTime.Now,
-                    ServerTimeStamp = DateTime.Now,
-                    Symbol = symbol,
-                    MDUpdateAction = eMDUpdateAction.New,
-                });
-            });
-        }
-        private void UpdateOrderBook(BitfinexOrderBookEntry lob_update, string symbol, DateTime ts)
-        {
-            if (!_localOrderBooks.ContainsKey(symbol))
-                return;
-            if (lob_update == null)
-                return;
-
-            var local_lob = _localOrderBooks[symbol];
-
-            if (local_lob != null)
-            {
-                bool isBid = lob_update.Quantity > 0;
-
-                if (lob_update.Count == 0) //remove
-                {
-                    var delta = new DeltaBookItem()
-                    {
-                        Price = (double)lob_update.Price,
-                        Size = (double)Math.Abs(lob_update.Quantity),
-                        IsBid = isBid,
-                        LocalTimeStamp = DateTime.Now,
-                        ServerTimeStamp = ts,
-                        Symbol = local_lob.Symbol,
-                        MDUpdateAction = eMDUpdateAction.Delete,
-                    };
-                    local_lob.DeleteLevel(delta);
-                }
-                else
-                {
-                    var delta = new DeltaBookItem()
-                    {
-                        Price = (double)lob_update.Price,
-                        Size = (double)Math.Abs(lob_update.Quantity),
-                        IsBid = isBid,
-                        LocalTimeStamp = DateTime.Now,
-                        ServerTimeStamp = ts,
-                        Symbol = local_lob.Symbol,
-                        MDUpdateAction = eMDUpdateAction.Change,
-                    };
-                    local_lob.AddOrUpdateLevel(delta);
-                }
-            }
-            RaiseOnDataReceived(local_lob);
-        }
-
 
         protected override void Dispose(bool disposing)
         {
@@ -617,21 +407,10 @@ namespace MarketConnectors.Bitfinex
                 _disposed = true;
                 if (disposing)
                 {
-                    UnattachEventHandlers(deltaSubscription?.Data);
-                    UnattachEventHandlers(tradesSubscription?.Data);
-                    _socketClient?.UnsubscribeAllAsync();
-                    _socketClient?.Dispose();
-                    _restClient?.Dispose();
                     _timerPing?.Dispose();
 
-                    foreach (var q in _eventBuffers)
-                        q.Value?.Dispose();
-                    _eventBuffers.Clear();
-
-                    foreach (var q in _tradesBuffers)
-                        q.Value?.Dispose();
-                    _tradesBuffers.Clear();
-
+                    _eventBuffers?.Dispose();
+                    _tradesBuffers?.Dispose();
 
                     if (_localOrderBooks != null)
                     {
@@ -654,11 +433,11 @@ namespace MarketConnectors.Bitfinex
             {
                 InitializeDefaultSettings();
             }
-            if (_settings.Provider == null) //To prevent back compability with older setting formats
+            if (_settings.Provider == null)
             {
-                _settings.Provider = new VisualHFT.Model.Provider() { ProviderID = 2, ProviderName = "Bitfinex" };
+                _settings.Provider = new VisualHFT.Model.Provider() { ProviderID = 1, ProviderName = "Bitfinex" };
             }
-            ParseSymbols(string.Join(',', _settings.Symbols.ToArray())); //Utilize normalization function
+            ParseSymbols(string.Join(',', _settings.Symbols.ToArray()));
         }
 
         protected override void SaveSettings()
@@ -672,62 +451,62 @@ namespace MarketConnectors.Bitfinex
             {
                 ApiKey = "",
                 ApiSecret = "",
-                DepthLevels = 25,
-                Provider = new VisualHFT.Model.Provider() { ProviderID = 2, ProviderName = "Bitfinex" },
-                Symbols = new List<string>() { "BTCUSD(BTC/USD)", "ETHUSD(ETH/USD)" } // Add more symbols as needed
+                DepthLevels = 10,
+                UpdateIntervalMs = 100,
+                IsNonUS = false,
+                Provider = new VisualHFT.Model.Provider() { ProviderID = 1, ProviderName = "Bitfinex" },
+                Symbols = new List<string>() { "BTCUSDT(BTC/USD)", "ETHUSDT(ETH/USD)" }
             };
             SaveToUserSettings(_settings);
         }
+
         public override object GetUISettings()
         {
             PluginSettingsView view = new PluginSettingsView();
             PluginSettingsViewModel viewModel = new PluginSettingsViewModel(CloseSettingWindow);
             viewModel.ApiSecret = _settings.ApiSecret;
             viewModel.ApiKey = _settings.ApiKey;
+            viewModel.UpdateIntervalMs = _settings.UpdateIntervalMs;
             viewModel.DepthLevels = _settings.DepthLevels;
             viewModel.ProviderId = _settings.Provider.ProviderID;
             viewModel.ProviderName = _settings.Provider.ProviderName;
             viewModel.Symbols = _settings.Symbols;
+            viewModel.IsNonUS = _settings.IsNonUS;
             viewModel.UpdateSettingsFromUI = () =>
             {
                 _settings.ApiSecret = viewModel.ApiSecret;
                 _settings.ApiKey = viewModel.ApiKey;
+                _settings.UpdateIntervalMs = viewModel.UpdateIntervalMs;
                 _settings.DepthLevels = viewModel.DepthLevels;
                 _settings.Provider = new VisualHFT.Model.Provider() { ProviderID = viewModel.ProviderId, ProviderName = viewModel.ProviderName };
                 _settings.Symbols = viewModel.Symbols;
+                _settings.IsNonUS = viewModel.IsNonUS;
                 SaveSettings();
-                ParseSymbols(string.Join(',', _settings.Symbols.ToArray()));
+                ParseSymbols(string.join(',', _settings.Symbols.ToArray()));
 
-                //run this because it will allow to reconnect with the new values
                 RaiseOnDataReceived(GetProviderModel(eSESSIONSTATUS.CONNECTING));
                 Status = ePluginStatus.STARTING;
                 Task.Run(async () => await HandleConnectionLost($"{this.Name} is starting (from reloading settings).", null, true));
-
-
             };
-            // Display the view, perhaps in a dialog or a new window.
             view.DataContext = viewModel;
             return view;
         }
 
-
-
-        //FOR UNIT TESTING PURPOSES
         public void InjectSnapshot(VisualHFT.Model.OrderBook snapshotModel, long sequence)
         {
-            var localModel = new BitfinexOrderBook();
-            localModel.Asks = snapshotModel.Asks.Select(x => new BitfinexOrderBookEntry() { Price = (decimal)x.Price, Quantity = (decimal)x.Size }).ToList();
-            localModel.Bids = snapshotModel.Bids.Select(x => new BitfinexOrderBookEntry() { Price = (decimal)x.Price, Quantity = (decimal)x.Size }).ToList();
-            _settings.DepthLevels = snapshotModel.MaxDepth; //force depth received
+            var localModel = new BinanceOrderBook();
+            localModel.Symbol = snapshotModel.Symbol;
+            localModel.Bids = snapshotModel.Bids.Select(x => new BinanceOrderBookEntry() { Price = x.Price.ToDecimal(), Quantity = x.Size.ToDecimal() }).ToList();
+            localModel.Asks = snapshotModel.Asks.Select(x => new BinanceOrderBookEntry() { Price = x.Price.ToDecimal(), Quantity = x.Size.ToDecimal() }).ToList();
+            _settings.DepthLevels = snapshotModel.MaxDepth;
+
             var symbol = snapshotModel.Symbol;
 
             if (!_localOrderBooks.ContainsKey(symbol))
             {
-                _localOrderBooks.Add(symbol, ToOrderBookModel(localModel, symbol));
+                _localOrderBooks.Add(symbol, ToOrderBookModel(localModel));
             }
-            else
-                _localOrderBooks[symbol] = ToOrderBookModel(localModel, symbol);
-            _localOrderBooks[symbol].Sequence = sequence;// Bitfinex does not provide sequence numbers
+            _localOrderBooks[symbol] = ToOrderBookModel(localModel);
 
             RaiseOnDataReceived(_localOrderBooks[symbol]);
         }
@@ -741,65 +520,19 @@ namespace MarketConnectors.Bitfinex
                 throw new Exception("Couldn't find the symbol for this model.");
             var ts = DateTime.Now;
 
-
-
-            //************************************************************************************************************************
-            //sequence is not provided by BITFINEX (then make adjustments to this method, so Unit tests don't fail)
-            //************************************************************************************************************************
-            long maxSequence = Math.Max(bidDeltaModel.Max(x => x.Sequence), askDeltaModel.Max(x => x.Sequence));
+            var localModel = new BinanceEventOrderBook();
+            localModel.Bids = bidDeltaModel?.Select(x => new BinanceOrderBookEntry() { Price = x.Price.ToDecimal(), Quantity = x.Size.ToDecimal() }).ToList();
+            localModel.Asks = askDeltaModel?.Select(x => new BinanceOrderBookEntry() { Price = x.Price.ToDecimal(), Quantity = x.Size.ToDecimal() }).ToList();
             long minSequence = Math.Min(bidDeltaModel.Min(x => x.Sequence), askDeltaModel.Min(x => x.Sequence));
-            if (_localOrderBooks.ContainsKey(symbol))
-            {
-                if (minSequence < _localOrderBooks[symbol].Sequence)
-                {
-                    bidDeltaModel.RemoveAll(x => x.Sequence <= _localOrderBooks[symbol].Sequence);
-                    askDeltaModel.RemoveAll(x => x.Sequence <= _localOrderBooks[symbol].Sequence);
-                }
-                else if (minSequence != _localOrderBooks[symbol].Sequence + 1)
-                {
-                    throw new Exception("Sequence numbers are not in order.");
-                }
-                else
-                    _localOrderBooks[symbol].Sequence = maxSequence;
-            }
-            //************************************************************************************************************************
-            //************************************************************************************************************************
+            long maxSequence = Math.Max(bidDeltaModel.Max(x => x.Sequence), askDeltaModel.Max(x => x.Sequence));
+            localModel.FirstUpdateId = minSequence;
+            localModel.LastUpdateId = maxSequence;
 
-
-            //transform to BitfinexOrderBookEntry
-            bidDeltaModel?.ForEach(x =>
-            {
-                decimal _qty = 0;
-                if (x.Size.HasValue)
-                    _qty = x.Size.ToDecimal();
-                else if (!x.Size.HasValue && x.MDUpdateAction == eMDUpdateAction.Delete)
-                    _qty = 1;
-                UpdateOrderBook(new BitfinexOrderBookEntry()
-                {
-                    Price = x.Price.ToDecimal(),
-                    Quantity = _qty,
-                    Count = x.MDUpdateAction == eMDUpdateAction.Delete ? 0 : 1
-                }, symbol, ts);
-            });
-            askDeltaModel?.ForEach(x =>
-            {
-                decimal _qty = 0;
-                if (x.Size.HasValue)
-                    _qty = x.Size.ToDecimal();
-                else if (!x.Size.HasValue && x.MDUpdateAction == eMDUpdateAction.Delete)
-                    _qty = 1;
-                UpdateOrderBook(new BitfinexOrderBookEntry()
-                {
-                    Price = x.Price.ToDecimal(),
-                    Quantity = -_qty,
-                    Count = x.MDUpdateAction == eMDUpdateAction.Delete ? 0 : 1
-                }, symbol, ts);
-            });
+            UpdateOrderBook(localModel, symbol);
         }
 
         public List<VisualHFT.Model.Order> ExecutePrivateMessageScenario(eTestingPrivateMessageScenario scenario)
         {
-            //depending on the scenario, load its message(s)
             string _file = "";
             if (scenario == eTestingPrivateMessageScenario.SCENARIO_1)
                 _file = "PrivateMessages_Scenario1.json";
@@ -818,153 +551,151 @@ namespace MarketConnectors.Bitfinex
             else if (scenario == eTestingPrivateMessageScenario.SCENARIO_8)
             {
                 _file = "PrivateMessages_Scenario8.json";
-                throw new ExceptionScenarioNotSupportedByExchange();
+                throw new Exception("Messages collected for this scenario don't look good.");
             }
             else if (scenario == eTestingPrivateMessageScenario.SCENARIO_9)
             {
                 _file = "PrivateMessages_Scenario9.json";
-                throw new ExceptionScenarioNotSupportedByExchange();
+                throw new Exception("Messages were not collected for this scenario.");
             }
             else if (scenario == eTestingPrivateMessageScenario.SCENARIO_10)
             {
                 _file = "PrivateMessages_Scenario10.json";
-                throw new ExceptionScenarioNotSupportedByExchange();
+                throw new Exception("Messages were not collected for this scenario.");
             }
 
-            string jsonString = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, $"bitfinex_jsonMessages/{_file}"));
+            string jsonString = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, $"Binance_JsonMessages/{_file}"));
 
-
-
-
-            //DESERIALIZE EXCHANGES MODEL
-            JArray outerArray = JArray.Parse(jsonString);
-            var modelList = outerArray.Select(item =>
+            List<BinanceStreamOrderUpdate> modelList = new List<BinanceStreamOrderUpdate>();
+            var dataEvents = new List<BinanceStreamOrderUpdate>();
+            var jsonArray = JArray.Parse(jsonString);
+            foreach (var jsonObject in jsonArray)
             {
-                //Reference to documentation: https://docs.bitfinex.com/reference/ws-auth-orders
-                var arr = (JArray)item[2];
+                JToken dataToken = jsonObject["data"];
+                string dataJsonString = dataToken.ToString();
 
+                BinanceStreamOrderUpdate _data = JsonParser.Parse(dataJsonString);
 
-                //parse status (ie: CANCELED, "EXECUTED @ 96211.0(0.0005)"
-                var _status = "";
-                if (arr[13].ToString().IndexOf(" ") > -1)
-                {
-                    _status = arr[13].ToString().Split(' ')[0];
-                }
-                else
-                    _status = arr[13].ToString();
+                if (_data != null)
+                    modelList.Add(_data);
+            }
 
-                return new BitfinexOrder
-                {
-                    Id = arr[0].Value<long>(),
-                    GroupId = arr[1].Type == JTokenType.Null ? null : arr[1].Value<long?>(),
-                    ClientOrderId = arr[2].Type == JTokenType.Null ? null : arr[2].Value<long?>(),
-                    Symbol = arr[3].Value<string>(),
-                    // Convert the Unix timestamps or apply your DateTimeConverter logic:
-                    CreateTime = DateTimeOffset.FromUnixTimeMilliseconds(arr[4].Value<long>()).LocalDateTime,
-                    UpdateTime = DateTimeOffset.FromUnixTimeMilliseconds(arr[5].Value<long>()).LocalDateTime,
-                    QuantityRemaining = arr[6].Value<decimal>(),
-                    QuantityRaw = arr[7].Value<decimal>(),
-                    //Type = (OrderType)Enum.Parse(typeof(OrderType), arr[8].Value<string>(), true),
-                    //TypePrevious = (OrderType)Enum.Parse(typeof(OrderType), arr[9].Value<string>(), true),
-                    //Status = (OrderStatus)Enum.Parse(typeof(OrderStatus), arr[13].Value<string>(), true),
-                    Type = DeserializeEnumWithConverter<OrderType>(arr[8]),
-                    TypePrevious = DeserializeEnumWithConverter<OrderType>(arr[9]),
-                    Status = DeserializeEnumWithConverter<OrderStatus>(_status),
-                    Price = arr[16].Type == JTokenType.Null ? 0 : arr[16].Value<decimal>(),
-                    PriceAverage = arr[17].Type == JTokenType.Null ? null : arr[17].Value<decimal?>(),
-                    PriceTrailing = arr[18].Type == JTokenType.Null ? 0 : arr[18].Value<decimal>(),
-                    Routing = arr[28].Type == JTokenType.Null ? string.Empty : arr[28].Value<string>(),
-                };
-            }).ToList();
-            //END DESERIALIZE EXCHANGES MODEL
-
-
-
-
-
-            //UPDATE VISUALHFT CORE & CREATE MODEL TO RETURN
             if (!modelList.Any())
                 throw new Exception("No data was found in the json file.");
             foreach (var item in modelList)
             {
-                UpdateUserOrder(item);
+                UpdateUserOrderBook(item);
             }
-            //END UPDATE VISUALHFT CORE
 
-
-            //CREATE MODEL TO RETURN 
-            var retOrders = new List<VisualHFT.Model.Order>();
+            var dicOrders = new Dictionary<string, VisualHFT.Model.Order>();
             foreach (var item in modelList)
             {
-                VisualHFT.Model.Order order = null;
-                if (retOrders.All(x => x.ClOrdId != item.ClientOrderId.ToString()))
+                VisualHFT.Model.Order localuserOrder;
+                if (!dicOrders.ContainsKey(item.ClientOrderId))
                 {
-                    order = new VisualHFT.Model.Order()
+                    localuserOrder = new VisualHFT.Model.Order();
+                    localuserOrder.OrderID = item.Id;
+                    localuserOrder.ClOrdId = !string.IsNullOrEmpty(item.ClientOrderId) ? item.ClientOrderId : item.Id.ToString();
+                    localuserOrder.Currency = GetNormalizedSymbol(item.Symbol);
+                    localuserOrder.CreationTimeStamp = item.CreateTime;
+                    localuserOrder.OrderID = item.Id;
+                    localuserOrder.ProviderId = _settings!.Provider.ProviderID;
+                    localuserOrder.ProviderName = _settings.Provider.ProviderName;
+                    localuserOrder.CreationTimeStamp = item.CreateTime;
+                    localuserOrder.Quantity = (double)item.Quantity;
+                    localuserOrder.PricePlaced = (double)item.Price;
+                    localuserOrder.Symbol = GetNormalizedSymbol(item.Symbol);
+                    localuserOrder.TimeInForce = eORDERTIMEINFORCE.GTC;
+
+                    if (item.TimeInForce == TimeInForce.ImmediateOrCancel)
                     {
-                        OrderID = item.Id,
-                        CreationTimeStamp = item.CreateTime,
-                        PricePlaced = item.Price.ToDouble(),
-                        Quantity = item.Quantity.ToDouble(),
-                        ProviderId = _settings.Provider.ProviderID,
-                        ProviderName = _settings.Provider.ProviderName,
-                        Symbol = item.Symbol,
-                        Side = item.Side == OrderSide.Buy ? eORDERSIDE.Buy : eORDERSIDE.Sell,
-                    };
-                    retOrders.Add(order);
+                        localuserOrder.TimeInForce = eORDERTIMEINFORCE.IOC;
+                    }
+                    else if (item.TimeInForce == TimeInForce.FillOrKill)
+                    {
+                        localuserOrder.TimeInForce = eORDERTIMEINFORCE.FOK;
+                    }
+                    if (item.Type == SpotOrderType.Market)
+                    {
+                        localuserOrder.OrderType = eORDERTYPE.MARKET;
+                    }
+                    else
+                    {
+                        localuserOrder.OrderType = eORDERTYPE.LIMIT;
+                    }
+
+                    if (item.Side == OrderSide.Buy)
+                    {
+                        localuserOrder.Side = eORDERSIDE.Buy;
+                    }
+                    else if (item.Side == OrderSide.Sell)
+                    {
+                        localuserOrder.Side = eORDERSIDE.Sell;
+                    }
+
+                    dicOrders.Add(item.ClientOrderId, localuserOrder);
                 }
                 else
                 {
-                    order = retOrders.FirstOrDefault(x => x.ClOrdId == item.ClientOrderId.ToString());
+                    localuserOrder = dicOrders[item.ClientOrderId];
                 }
 
-                order.ClOrdId = item.ClientOrderId.ToString();
-                if (item.Type != OrderType.ExchangeMarket && item.Type != OrderType.Market)
-                    order.Quantity = item.Quantity.ToDouble();
-
-
-                if (item.Type == OrderType.ExchangeFillOrKill || item.Type == OrderType.FillOrKill)
-                    order.TimeInForce = eORDERTIMEINFORCE.FOK;
-                else if (item.Type == OrderType.ExchangeImmediateOrCancel || item.Type == OrderType.ImmediateOrCancel)
-                    order.TimeInForce = eORDERTIMEINFORCE.IOC;
-                else
-                    order.TimeInForce = eORDERTIMEINFORCE.GTC;
-
-                if (item.Type == OrderType.Market || item.Type == OrderType.ExchangeMarket)
-                    order.OrderType = eORDERTYPE.MARKET;
-                else
-                    order.OrderType = eORDERTYPE.LIMIT;
-
-                if (item.Status == OrderStatus.Active)
+                if (item.Status == OrderStatus.New || item.Status == OrderStatus.PendingNew)
                 {
-                    order.PricePlaced = item.Price.ToDouble();
-                    order.Quantity = item.Quantity.ToDouble();
-                    order.Status = eORDERSTATUS.NEW;
+                    if (item.Side == OrderSide.Buy)
+                    {
+                        localuserOrder.CreationTimeStamp = item.CreateTime;
+                        localuserOrder.PricePlaced = (double)item.Price;
+                        localuserOrder.BestBid = (double)item.Price;
+                        localuserOrder.Side = eORDERSIDE.Buy;
+                    }
+                    if (item.Side == OrderSide.Sell)
+                    {
+                        localuserOrder.Side = eORDERSIDE.Sell;
+                        localuserOrder.BestAsk = (double)item.Price;
+                        localuserOrder.CreationTimeStamp = item.CreateTime;
+                        localuserOrder.Quantity = (double)item.Quantity;
+                    }
+                    localuserOrder.Status = eORDERSTATUS.NEW;
                 }
-                else if (item.Status == OrderStatus.Canceled)
-                    order.Status = eORDERSTATUS.CANCELED;
-                else if (item.Status == OrderStatus.Executed || item.Status == OrderStatus.ForcefullyExecuted || item.Status == OrderStatus.PartiallyFilled)
+                if (item.Status == OrderStatus.Filled)
                 {
-                    order.Status = (item.Status == OrderStatus.PartiallyFilled? eORDERSTATUS.PARTIALFILLED:  eORDERSTATUS.FILLED);
-                    order.FilledQuantity = order.Quantity - item.QuantityRemaining.ToDouble();
-                    order.FilledPrice = item.PriceAverage.ToDouble();
+                    localuserOrder.BestAsk = (double)item.Price;
+                    localuserOrder.BestBid = (double)item.Price;
+                    localuserOrder.FilledQuantity = (double)(item.QuantityFilled);
+                    localuserOrder.Status = eORDERSTATUS.FILLED;
+                }
+                if (item.Status == OrderStatus.Canceled)
+                {
+                    localuserOrder.Status = eORDERSTATUS.CANCELED;
                 }
 
+                if (item.Status == OrderStatus.Rejected)
+                {
+                    localuserOrder.Status = eORDERSTATUS.REJECTED;
+                }
 
-                
+                if (item.Status == OrderStatus.PartiallyFilled)
+                {
+                    localuserOrder.BestAsk = (double)item.Price;
+                    localuserOrder.BestBid = (double)item.Price;
+                    localuserOrder.Status = eORDERSTATUS.PARTIALFILLED;
+                }
+
+                if (item.Status == OrderStatus.PendingCancel)
+                {
+                    localuserOrder.Status = eORDERSTATUS.CANCELEDSENT;
+                }
+                localuserOrder.LastUpdated = DateTime.Now;
+
+                if (!string.IsNullOrEmpty(item.OriginalClientOrderId) && item.OriginalClientOrderId != item.ClientOrderId)
+                {
+                    if (dicOrders.TryGetValue(item.OriginalClientOrderId, out var originalOrder))
+                        originalOrder.Status = localuserOrder.Status;
+                }
             }
-            //END CREATE MODEL TO RETURN
 
-
-            return retOrders;
-        }
-        private T DeserializeEnumWithConverter<T>(JToken token)
-        {
-            // Create settings with the converter that handles the Map attribute
-            var settings = new JsonSerializerSettings();
-            settings.Converters.Add(new EnumConverter());
-            // Serialize the token’s value (which is just a string) into proper JSON (with quotes)
-            string json = JsonConvert.SerializeObject(token.Value<string>());
-            return JsonConvert.DeserializeObject<T>(json, settings);
+            return dicOrders.Values.ToList();
         }
     }
 }
